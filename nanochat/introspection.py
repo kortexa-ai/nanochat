@@ -47,6 +47,9 @@ class IntrospectableEngine:
         self._step = 0            # forward pass counter (reset on clear)
         self._neuron_hooks = []   # neuron intervention hook handles (separate from observation)
         self._neuron_scales = {}  # {layer_idx: {neuron_idx: factor}} for runtime intervention
+        self._head_hooks = []     # attention head hook handles
+        self._head_scales = {}    # {layer_idx: {head_idx: factor}} for head-level intervention
+        self._head_tap_layers = set()  # layers with active head taps
 
     # -------------------------------------------------------------------------
     # Activation observation
@@ -227,6 +230,11 @@ class IntrospectableEngine:
             handle.remove()
         self._neuron_hooks.clear()
         self._neuron_scales.clear()
+        for handle in self._head_hooks:
+            handle.remove()
+        self._head_hooks.clear()
+        self._head_scales.clear()
+        self._head_tap_layers.clear()
         self._frames.clear()
         self._current_taps.clear()
         self._step = 0
@@ -397,6 +405,121 @@ class IntrospectableEngine:
             else:
                 remaining.append(handle)
         self._neuron_hooks = remaining
+
+    # -------------------------------------------------------------------------
+    # Attention head observation + intervention
+    # -------------------------------------------------------------------------
+
+    def tap_attention_heads(self, layer_idx):
+        """
+        Tap per-head output norms from attention.
+
+        Installs a combined pre-hook on attn.c_proj that captures per-head
+        L2 norms BEFORE any scaling intervention (preserving the observation
+        invariant). Returns tap name 'layer_N_heads'.
+
+        The tap tensor has shape (B, T, n_head) — one L2 norm per head.
+        """
+        self._head_tap_layers.add(layer_idx)
+        self._install_head_hook(layer_idx)
+        self._ensure_finalizer()
+        return f"layer_{layer_idx}_heads"
+
+    def set_head_scales(self, layer_idx, scales):
+        """
+        Scale specific attention heads during forward passes.
+
+        Installs a pre-hook on attn.c_proj that multiplies selected head
+        slices in the concatenated attention output before down-projection.
+
+        Args:
+            layer_idx: which transformer layer
+            scales: dict mapping head indices to scale factors.
+                    e.g. {0: 0.0, 5: 2.0}
+                    factor 0.0 = ablate, 1.0 = no-op, 2.0 = double
+        """
+        if layer_idx not in self._head_scales:
+            self._head_scales[layer_idx] = {}
+        self._head_scales[layer_idx].update(scales)
+        self._install_head_hook(layer_idx)
+
+    def clear_head_scales(self, layer_idx=None):
+        """
+        Remove head scaling interventions.
+
+        Args:
+            layer_idx: which layer to clear, or None to clear all layers.
+        """
+        if layer_idx is not None:
+            self._head_scales.pop(layer_idx, None)
+            # Reinstall hook if still tapping, otherwise remove
+            if layer_idx in self._head_tap_layers:
+                self._install_head_hook(layer_idx)
+            else:
+                self._remove_head_hook(layer_idx)
+        else:
+            self._head_scales.clear()
+            # Reinstall tap-only hooks, remove scale-only hooks
+            active = set()
+            for handle in self._head_hooks:
+                lid = getattr(handle, '_head_layer_idx', None)
+                if lid is not None and lid not in self._head_tap_layers:
+                    handle.remove()
+                else:
+                    active.add(lid)
+            # Reinstall for tap layers (hooks now have no scales to apply)
+            for lid in self._head_tap_layers:
+                self._install_head_hook(lid)
+
+    def get_head_scales(self, layer_idx=None):
+        """Return current head scales. If layer_idx given, return that layer's dict."""
+        if layer_idx is not None:
+            return dict(self._head_scales.get(layer_idx, {}))
+        return {l: dict(s) for l, s in self._head_scales.items()}
+
+    def _install_head_hook(self, layer_idx):
+        """Install or replace the combined head observation+intervention pre-hook."""
+        self._remove_head_hook(layer_idx)
+
+        attn = self.model.transformer.h[layer_idx].attn
+        c_proj = attn.c_proj
+        n_head = attn.n_head
+        head_dim = attn.head_dim
+        tapping = layer_idx in self._head_tap_layers
+
+        def _pre_hook(mod, args, _layer=layer_idx, _n_head=n_head,
+                      _head_dim=head_dim, _tapping=tapping):
+            x = args[0]  # (B, T, n_embd)
+
+            if _tapping:
+                # Observation: per-head L2 norms BEFORE any scaling
+                heads = x.view(x.shape[0], x.shape[1], _n_head, _head_dim)
+                norms = heads.norm(dim=-1)  # (B, T, n_head)
+                self._current_taps[f"layer_{_layer}_heads"] = norms.detach()
+
+            # Intervention: scale specified heads
+            scales = self._head_scales.get(_layer)
+            if scales:
+                for head_idx, factor in scales.items():
+                    start = head_idx * _head_dim
+                    end = start + _head_dim
+                    x[:, :, start:end] = x[:, :, start:end] * factor
+                return (x,)
+            return args
+
+        handle = c_proj.register_forward_pre_hook(_pre_hook)
+        handle._head_layer_idx = layer_idx
+        self._head_hooks.append(handle)
+
+    def _remove_head_hook(self, layer_idx):
+        """Remove the head hook for a specific layer."""
+        remaining = []
+        for handle in self._head_hooks:
+            if getattr(handle, '_head_layer_idx', None) == layer_idx:
+                handle.remove()
+            else:
+                remaining.append(handle)
+        self._head_hooks = remaining
 
     # -------------------------------------------------------------------------
     # Snapshot / restore (for safe experimentation)
