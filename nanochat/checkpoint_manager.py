@@ -148,11 +148,16 @@ def build_model(checkpoint_dir, step, device, phase):
         model.eval()
     else:
         model.train()
-    # Load the Tokenizer (prefer local tokenizer.json if present in checkpoint dir)
-    local_tokenizer_path = os.path.join(checkpoint_dir, "tokenizer.json")
-    if os.path.exists(local_tokenizer_path):
-        log0(f"Using local tokenizer from {local_tokenizer_path}")
+    # Load the Tokenizer (prefer local tokenizer in checkpoint dir, then fall back to global)
+    local_tokenizer_json = os.path.join(checkpoint_dir, "tokenizer.json")
+    local_tokenizer_pkl = os.path.join(checkpoint_dir, "tokenizer.pkl")
+    if os.path.exists(local_tokenizer_json):
+        log0(f"Using local HF tokenizer from {local_tokenizer_json}")
         tokenizer = HuggingFaceTokenizer.from_directory(checkpoint_dir)
+    elif os.path.exists(local_tokenizer_pkl):
+        from nanochat.tokenizer import RustBPETokenizer
+        log0(f"Using local RustBPE tokenizer from {local_tokenizer_pkl}")
+        tokenizer = RustBPETokenizer.from_directory(checkpoint_dir)
     else:
         tokenizer = get_tokenizer()
     # Sanity check: compatibility between model and tokenizer

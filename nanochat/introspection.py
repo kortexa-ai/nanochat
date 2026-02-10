@@ -53,8 +53,9 @@ class IntrospectableEngine:
         self._residual_hook = None       # handle for lm_head capture hook
         self._injection_hook = None      # handle for Block[0] injection hook
         self._captured_residual = None   # tensor: last-token residual from lm_head input
-        self._injection_vector = None    # tensor to inject into Block[0]
+        self._injection_vector = None    # tensor to inject into a block
         self._injection_alpha = 0.0      # blending strength
+        self._injection_layer = 0        # which block to inject into
 
     # -------------------------------------------------------------------------
     # Activation observation
@@ -556,25 +557,32 @@ class IntrospectableEngine:
         """Return the most recently captured residual vector, or None."""
         return self._captured_residual
 
-    def set_residual_injection(self, vector, alpha=1.0):
+    def set_residual_injection(self, vector, alpha=1.0, layer_idx=0):
         """
-        Inject a vector additively into Block[0] input on next forward pass.
+        Inject a vector additively into a block's input on next forward pass.
 
-        The injection is additive: x = x + alpha * v, preserving the new
+        The injection is additive: x = x + alpha * v, preserving the
         prompt's embedding while adding prior-inference signal. The vector
         is broadcast across all token positions.
 
         Args:
             vector: (n_embd,) or (1, n_embd) tensor to inject
             alpha: blending strength (0.0 = no injection, 1.0 = full add)
+            layer_idx: which block to inject into (default 0 = first block)
         """
         self._injection_vector = vector.detach()
         self._injection_alpha = alpha
 
+        # If layer changed or no hook yet, (re)install
+        if self._injection_hook is not None and self._injection_layer == layer_idx:
+            return  # same layer, hook already installed, will use new vector/alpha
+        # Remove old hook if switching layers
         if self._injection_hook is not None:
-            return  # hook already installed, will use new vector/alpha
+            self._injection_hook.remove()
+            self._injection_hook = None
 
-        block0 = self.model.transformer.h[0]
+        self._injection_layer = layer_idx
+        block = self.model.transformer.h[layer_idx]
 
         def _pre_hook(mod, args):
             if self._injection_vector is None or self._injection_alpha == 0.0:
@@ -588,7 +596,7 @@ class IntrospectableEngine:
             x = x + self._injection_alpha * v
             return (x,) + args[1:]
 
-        self._injection_hook = block0.register_forward_pre_hook(_pre_hook)
+        self._injection_hook = block.register_forward_pre_hook(_pre_hook)
 
     def clear_residual_injection(self):
         """Remove injection hook and clear state."""
