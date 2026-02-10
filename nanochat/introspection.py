@@ -50,6 +50,11 @@ class IntrospectableEngine:
         self._head_hooks = []     # attention head hook handles
         self._head_scales = {}    # {layer_idx: {head_idx: factor}} for head-level intervention
         self._head_tap_layers = set()  # layers with active head taps
+        self._residual_hook = None       # handle for lm_head capture hook
+        self._injection_hook = None      # handle for Block[0] injection hook
+        self._captured_residual = None   # tensor: last-token residual from lm_head input
+        self._injection_vector = None    # tensor to inject into Block[0]
+        self._injection_alpha = 0.0      # blending strength
 
     # -------------------------------------------------------------------------
     # Activation observation
@@ -235,6 +240,11 @@ class IntrospectableEngine:
         self._head_hooks.clear()
         self._head_scales.clear()
         self._head_tap_layers.clear()
+        if self._residual_hook is not None:
+            self._residual_hook.remove()
+            self._residual_hook = None
+        self._captured_residual = None
+        self.clear_residual_injection()
         self._frames.clear()
         self._current_taps.clear()
         self._step = 0
@@ -520,6 +530,73 @@ class IntrospectableEngine:
             else:
                 remaining.append(handle)
         self._head_hooks = remaining
+
+    # -------------------------------------------------------------------------
+    # Inter-inference residual capture + injection
+    # -------------------------------------------------------------------------
+
+    def tap_final_residual(self):
+        """
+        Capture the final normalized residual at lm_head input.
+
+        Installs a pre-hook on lm_head that grabs the last-token residual
+        from each forward pass. During decode, this is the single-token
+        state (1, n_embd) that becomes the trail's final state at EOS.
+        """
+        if self._residual_hook is not None:
+            return  # already installed
+
+        def _pre_hook(mod, args):
+            x = args[0]  # (B, T, n_embd) — post-norm, pre-projection
+            self._captured_residual = x[:, -1, :].detach().clone()  # (B, n_embd)
+
+        self._residual_hook = self.model.lm_head.register_forward_pre_hook(_pre_hook)
+
+    def get_captured_residual(self):
+        """Return the most recently captured residual vector, or None."""
+        return self._captured_residual
+
+    def set_residual_injection(self, vector, alpha=1.0):
+        """
+        Inject a vector additively into Block[0] input on next forward pass.
+
+        The injection is additive: x = x + alpha * v, preserving the new
+        prompt's embedding while adding prior-inference signal. The vector
+        is broadcast across all token positions.
+
+        Args:
+            vector: (n_embd,) or (1, n_embd) tensor to inject
+            alpha: blending strength (0.0 = no injection, 1.0 = full add)
+        """
+        self._injection_vector = vector.detach()
+        self._injection_alpha = alpha
+
+        if self._injection_hook is not None:
+            return  # hook already installed, will use new vector/alpha
+
+        block0 = self.model.transformer.h[0]
+
+        def _pre_hook(mod, args):
+            if self._injection_vector is None or self._injection_alpha == 0.0:
+                return args
+            x = args[0]  # (B, T, n_embd)
+            v = self._injection_vector
+            if v.dim() == 1:
+                v = v.unsqueeze(0).unsqueeze(0)  # (1, 1, n_embd)
+            elif v.dim() == 2:
+                v = v.unsqueeze(1)  # (B, 1, n_embd)
+            x = x + self._injection_alpha * v
+            return (x,) + args[1:]
+
+        self._injection_hook = block0.register_forward_pre_hook(_pre_hook)
+
+    def clear_residual_injection(self):
+        """Remove injection hook and clear state."""
+        self._injection_vector = None
+        self._injection_alpha = 0.0
+        if self._injection_hook is not None:
+            self._injection_hook.remove()
+            self._injection_hook = None
 
     # -------------------------------------------------------------------------
     # Snapshot / restore (for safe experimentation)
